@@ -30,7 +30,8 @@ import requests
 
 # ---------------------------------------------------------------- settings
 CHANNEL = os.environ.get("CHANNEL_URL", "https://www.youtube.com/@thehof.talesrunner").rstrip("/")
-WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+# one or more webhook links (one per line, or separated by commas/spaces) → every room gets every post
+WEBHOOKS = [w for w in re.split(r"[\s,]+", os.environ.get("DISCORD_WEBHOOK_URL", "")) if w.startswith("http")]
 COOKIES = os.environ.get("YT_COOKIES_FILE", "")
 INTERVAL = int(os.environ.get("FRAME_INTERVAL", "15"))      # seconds between frames
 # evidence needed before posting: same spelling read cleanly in 2 frames (30 s), or ~8 frames of guessed reads
@@ -239,7 +240,7 @@ def persist(msg):
 
 
 def discord(content=None, embed=None, image=None):
-    if not WEBHOOK:
+    if not WEBHOOKS:
         log("[discord-dry-run]", content or "", json.dumps(embed, ensure_ascii=False) if embed else "")
         return
     payload = {"content": content, "allowed_mentions": {"parse": []}}
@@ -247,22 +248,26 @@ def discord(content=None, embed=None, image=None):
         if image:
             embed["image"] = {"url": "attachment://frame.jpg"}
         payload["embeds"] = [embed]
-    for _ in range(4):
-        try:
-            if image and os.path.exists(image):
-                with open(image, "rb") as f:
-                    r = requests.post(WEBHOOK, data={"payload_json": json.dumps(payload)},
-                                      files={"files[0]": ("frame.jpg", f, "image/jpeg")}, timeout=30)
-            else:
-                r = requests.post(WEBHOOK, json=payload, timeout=30)
-            if r.status_code == 429:
-                time.sleep(float(r.json().get("retry_after", 2)) + 0.5)
-                continue
-            r.raise_for_status()
-            return
-        except Exception as e:
-            log("discord error:", e)
-            time.sleep(3)
+    for n, hook in enumerate(WEBHOOKS, 1):
+        for _ in range(4):
+            try:
+                if image and os.path.exists(image):
+                    with open(image, "rb") as f:
+                        r = requests.post(hook, data={"payload_json": json.dumps(payload)},
+                                          files={"files[0]": ("frame.jpg", f, "image/jpeg")}, timeout=30)
+                else:
+                    r = requests.post(hook, json=payload, timeout=30)
+                if r.status_code == 429:
+                    time.sleep(float(r.json().get("retry_after", 2)) + 0.5)
+                    continue
+                if r.status_code in (401, 403, 404):
+                    log(f"discord: webhook #{n} was deleted or is wrong (HTTP {r.status_code}), skipping it")
+                    break
+                r.raise_for_status()
+                break
+            except Exception as e:
+                log(f"discord error (webhook #{n}):", type(e).__name__)  # never log the URL itself
+                time.sleep(3)
 
 
 _warned_block = False
