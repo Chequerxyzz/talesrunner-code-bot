@@ -273,6 +273,14 @@ def discord(content=None, embed=None, image=None):
 _warned_block = False
 
 
+def recovered():
+    """After a ⚠️ warning, say so as soon as the video can be read again."""
+    global _warned_block
+    if _warned_block:
+        _warned_block = False
+        discord("✅ บอทกลับมาดูไลฟ์ได้แล้ว ไม่ต้องทำอะไรครับ")
+
+
 def warn_blocked(err):
     global _warned_block
     if _warned_block:
@@ -445,6 +453,8 @@ def run_frames(url, scan, offset_fn, deadline):
                 n = int(os.path.basename(p)[2:8])
                 scan.frame(p, offset_fn(n, p))
                 scan.frames += 1
+                if scan.frames == 1:
+                    recovered()
                 if scan.frames % 40 == 0:
                     log(f"{scan.frames} frames read, top readings: {scan.counts.most_common(6)}")
                 os.remove(p)
