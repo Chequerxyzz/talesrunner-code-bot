@@ -427,7 +427,7 @@ class Scan:
 
     def send(self, code, path, offset, when, label):
         link = f"https://youtu.be/{self.vid}?t={int(offset)}"
-        discord(content=label,
+        discord(content=f"{label}\n```\n{code}\n```",  # code box: one-click copy button on a computer
                 embed={"description": f"📺 **{self.title}**\n🕒 {when:%d/%m %H:%M} น. "
                                       f"(นาทีที่ {hms(offset)}) — [ดูช่วงนี้]({link})",
                        "color": 0xF5A623},
