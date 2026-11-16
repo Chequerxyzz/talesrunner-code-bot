@@ -36,6 +36,9 @@ INTERVAL = int(os.environ.get("FRAME_INTERVAL", "15"))      # seconds between fr
 # evidence needed before posting: same spelling read cleanly in 2 frames (30 s), or ~8 frames of guessed reads
 THRESHOLD = float(os.environ.get("CODE_THRESHOLD", "4"))
 MIN_SCORE = float(os.environ.get("OCR_MIN_SCORE", "0.85"))  # OCR confidence needed for a full-weight read
+# Text that looks like a code but isn't (placeholder in the stream overlay template etc.).
+# More can be added one per line in state/blocked.txt
+BLOCKED = {"TONT4N2A2I2I", "ROSA4L8R4Z9I"}
 STATE_DIR = os.environ.get("STATE_DIR", "state")
 GIT_PERSIST = os.environ.get("GIT_PERSIST") == "1"
 # Schedule window in Thai time (streams 14:00-~24:00). Outside it the watcher exits when nothing is live.
@@ -142,6 +145,21 @@ def extract_codes(lines):
                     if c:
                         add(c, 1 if ctx and sure else 0.25, src)
     return found
+
+
+_blocked_cache = None
+
+
+def blocked():
+    global _blocked_cache
+    if _blocked_cache is None:
+        _blocked_cache = set(BLOCKED)
+        try:
+            with open(os.path.join(STATE_DIR, "blocked.txt"), encoding="utf-8") as f:
+                _blocked_cache |= {l.strip().upper() for l in f if l.strip() and not l.startswith("#")}
+        except OSError:
+            pass
+    return _blocked_cache
 
 
 def hamming(a, b):
@@ -336,6 +354,8 @@ class Scan:
             log("ocr error:", e)
             return
         for code, (w, src) in extract_codes(lines).items():
+            if code in blocked():
+                continue
             self.counts[code] += w
             self.src[code] = src
             cl = next((c for c in self.clusters if any(hamming(code, k) <= 2 for k in c["v"])), None)
@@ -438,7 +458,8 @@ def run_frames(url, scan, offset_fn, deadline):
             scan.err = ""
     if scan.frames == 0:
         log("NO FRAMES. downloader output:\n" + scan.err)
-        if "Sign in to confirm" in scan.err or "429" in scan.err:
+        # live mode retries by itself and only warns after repeated failures (see watch_stream)
+        if scan.mode != "live" and ("Sign in to confirm" in scan.err or "429" in scan.err):
             warn_blocked(scan.err)
     return ended
 
@@ -460,10 +481,14 @@ def watch_stream(info, deadline):
         persist(f"live {scan.vid}")
     log("watching", scan.vid, scan.title)
     live_offset = lambda n, p: os.path.getmtime(p) - scan.start_ts
+    fails = 0
     while time.time() < deadline:
         if not run_frames(url, scan, live_offset, deadline):
             return  # out of time; next run continues this stream
-        time.sleep(5)
+        fails = fails + 1 if scan.frames == 0 else 0
+        if fails == 3:  # a one-off hiccup (e.g. 429 Too Many Requests) is normal; 3 in a row is not
+            warn_blocked(scan.err)
+        time.sleep(5 if fails == 0 else min(30 * fails, 300))
         again = get_live()
         if again and again["id"] == scan.vid:
             log("pipeline stopped but stream still live -> restarting")
