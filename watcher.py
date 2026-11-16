@@ -472,7 +472,8 @@ def run_frames(url, scan, offset_fn, deadline):
 
 
 def summary(scan):
-    codes = scan.state["codes"]
+    # drop junk that was saved before it was blocked (e.g. by a run that started with older code)
+    codes = [c for c in scan.state["codes"] if c not in blocked()]
     body = "\n".join(f"`{c}`" for c in codes) if codes else "ไม่พบโค้ดในไลฟ์นี้"
     discord(embed={"title": "📋 สรุปโค้ดจากไลฟ์", "color": 0x5865F2,
                    "description": f"**{scan.title}**\nhttps://youtu.be/{scan.vid}\n\n{body}"})
