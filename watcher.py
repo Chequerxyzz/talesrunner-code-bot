@@ -35,6 +35,7 @@ COOKIES = os.environ.get("YT_COOKIES_FILE", "")
 INTERVAL = int(os.environ.get("FRAME_INTERVAL", "15"))      # seconds between frames
 # evidence needed before posting: same spelling read cleanly in 2 frames (30 s), or ~8 frames of guessed reads
 THRESHOLD = float(os.environ.get("CODE_THRESHOLD", "4"))
+MIN_SCORE = float(os.environ.get("OCR_MIN_SCORE", "0.85"))  # OCR confidence needed for a full-weight read
 STATE_DIR = os.environ.get("STATE_DIR", "state")
 GIT_PERSIST = os.environ.get("GIT_PERSIST") == "1"
 # Schedule window in Thai time (streams 14:00-~24:00). Outside it the watcher exits when nothing is live.
@@ -110,29 +111,36 @@ def _fix(window):
 
 
 def extract_codes(lines):
-    """Return {code: weight} for one frame.
-    Weight: read exactly (anywhere on screen, label or not) = 2,
-    needed OCR letter/digit correction = 1 next to the word CODE, 0.5 otherwise."""
+    """Return {code: (weight, source text)} for one frame.
+    Weight: confident OCR, code standing on its own anywhere on screen (label or not) = 2;
+    low-confidence or buried inside other text = 0.5;
+    needed letter/digit correction = 1 next to the word CODE, 0.25 otherwise."""
     found = {}
 
-    def add(c, w):
-        found[c] = max(found.get(c, 0), w)
+    def add(c, w, src):
+        if w > found.get(c, (0, ""))[0]:
+            found[c] = (w, src)
 
-    for line in lines:
+    for item in lines:
+        line, score = item if isinstance(item, tuple) else (item, 1.0)
         up = line.upper()
+        sure = score >= MIN_SCORE   # OCR is confident about this text box (Thai text read as junk scores low)
         ctx = "CODE" in re.sub(r"[^A-Z]", "", up.replace("0", "O"))
+        src = f"{line} ({score:.2f})"
         # exact matches, also with spaces removed (OCR sometimes splits a code)
         for text in (up, re.sub(r"\s+", "", up)):
             for tok in re.split(r"[^A-Z0-9]+", text):
                 for c in CODE_RE.findall(tok):
-                    add(c, 2)
+                    # full weight only when the code stands on its own (or right after "CODE" / "CODE1")
+                    clean = tok == c or re.fullmatch(r"C[O0]DE\d?" + c, tok)
+                    add(c, 2 if clean and sure else 0.5, src)
         # fuzzy: tokens about the length of a code
         for tok in re.split(r"[^A-Z0-9]+", up):
             if 12 <= len(tok) <= 14 and not CODE_RE.search(tok):
                 for i in range(len(tok) - 11):
                     c = _fix(tok[i:i + 12])
                     if c:
-                        add(c, 1 if ctx else 0.5)
+                        add(c, 1 if ctx and sure else 0.25, src)
     return found
 
 
@@ -149,7 +157,7 @@ def _ocr_img(img):
         from rapidocr_onnxruntime import RapidOCR
         _ocr = RapidOCR()
     result, _ = _ocr(img)
-    return [r[1] for r in (result or [])]
+    return [(r[1], float(r[2])) for r in (result or [])]
 
 
 def ocr_lines(path):
@@ -314,9 +322,10 @@ class Scan:
         self.post = post
         self.counts = Counter()     # weighted sightings per exact spelling
         self.clusters = []          # [{"v": Counter, "posted": code|None}] similar spellings grouped
+        self.src = {}               # last OCR text each code was read from (for debugging)
         self.frames = 0
         self.err = ""
-        self.state = _load(video_file(self.vid)) or {
+        self.state =_load(video_file(self.vid)) or {
             "id": self.vid, "title": self.title, "start": self.start_ts,
             "codes": [], "ended": False, "rescanned": False}
 
@@ -326,8 +335,9 @@ class Scan:
         except Exception as e:
             log("ocr error:", e)
             return
-        for code, w in extract_codes(lines).items():
+        for code, (w, src) in extract_codes(lines).items():
             self.counts[code] += w
+            self.src[code] = src
             cl = next((c for c in self.clusters if any(hamming(code, k) <= 2 for k in c["v"])), None)
             if cl is None:
                 cl = {"v": Counter(), "posted": None}
@@ -364,7 +374,7 @@ class Scan:
             label = f"✏️ แก้ไข: โค้ดที่ส่งไปก่อนหน้า `{wrong}` อ่านผิด ที่ถูกคือ"
         if self.mode == "test":
             if self.post:
-                self.send(code, path, offset, when, label)
+                self.send(code, path, offset, when, label + f"\n-# อ่านจาก: {self.src.get(code, '')[:120]}")
             return
         if wrong and wrong in self.state["codes"]:
             self.state["codes"].remove(wrong)
@@ -493,6 +503,9 @@ def cmd_watch(max_minutes):
             log("nothing live and outside schedule window -> exit")
             break
         time.sleep(60)
+    else:
+        if in_window() or get_live():
+            open(".continue", "w").close()  # tells the workflow to start the next run right away
     log("watch finished")
 
 
