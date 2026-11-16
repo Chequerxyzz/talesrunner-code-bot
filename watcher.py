@@ -414,11 +414,13 @@ class Scan:
 
     def send(self, code, path, offset, when, label):
         link = f"https://youtu.be/{self.vid}?t={int(offset)}"
-        discord(content=f"{label}\n```\n{code}\n```",
+        discord(content=label,
                 embed={"description": f"📺 **{self.title}**\n🕒 {when:%d/%m %H:%M} น. "
                                       f"(นาทีที่ {hms(offset)}) — [ดูช่วงนี้]({link})",
                        "color": 0xF5A623},
                 image=path)
+        # the code goes alone in its own message, so on a phone "long-press → Copy Text" copies just the code
+        discord(content=code)
 
 
 def run_frames(url, scan, offset_fn, deadline):
