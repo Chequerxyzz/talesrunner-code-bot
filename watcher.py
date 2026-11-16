@@ -249,13 +249,15 @@ def get_live():
     return None
 
 
-def start_pipeline(url, outdir):
+def start_pipeline(url, outdir, errpath):
     """yt-dlp -> ffmpeg, writing one JPEG every INTERVAL seconds of video."""
-    y = subprocess.Popen(ytdlp_cmd(need_ffmpeg=True) + ["--quiet","-f", "bv*[height<=1080]/b", "-o", "-", url],
-                         stdout=subprocess.PIPE)
+    errf = open(errpath, "wb")
+    y = subprocess.Popen(ytdlp_cmd(need_ffmpeg=True) + ["-f", "bv*[height<=1080]/b", "-o", "-", url],
+                         stdout=subprocess.PIPE, stderr=errf)
     f = subprocess.Popen([ffmpeg_exe(), "-loglevel", "error", "-i", "pipe:0", "-vf", f"fps=1/{INTERVAL}",
-                          "-q:v", "3", os.path.join(outdir, "f_%06d.jpg")], stdin=y.stdout)
+                          "-q:v", "3", os.path.join(outdir, "f_%06d.jpg")], stdin=y.stdout, stderr=errf)
     y.stdout.close()
+    errf.close()
     return y, f
 
 
@@ -327,8 +329,10 @@ class Scan:
 def run_frames(url, scan, offset_fn, deadline):
     """Run the pipeline until the video ends or deadline. Returns True if it ended by itself."""
     tmp = tempfile.mkdtemp(prefix="frames_")
-    y, f = start_pipeline(url, tmp)
+    errpath = tmp + "_err.log"
+    y, f = start_pipeline(url, tmp, errpath)
     ended = False
+    scan.frames = 0
     try:
         while True:
             done = f.poll() is not None
@@ -338,6 +342,9 @@ def run_frames(url, scan, offset_fn, deadline):
             for p in files:
                 n = int(os.path.basename(p)[2:8])
                 scan.frame(p, offset_fn(n, p))
+                scan.frames += 1
+                if scan.frames % 40 == 0:
+                    log(f"{scan.frames} frames read, codes so far: {dict(scan.counts)}")
                 os.remove(p)
             if done:
                 ended = True
@@ -348,6 +355,16 @@ def run_frames(url, scan, offset_fn, deadline):
     finally:
         stop(f, y)
         shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            with open(errpath, encoding="utf-8", errors="replace") as ef:
+                scan.err = "\n".join(l for l in ef.read().splitlines() if "[download]" not in l)[-800:]
+            os.remove(errpath)
+        except OSError:
+            scan.err = ""
+    if scan.frames == 0:
+        log("NO FRAMES. downloader output:\n" + scan.err)
+        if "Sign in to confirm" in scan.err or "429" in scan.err:
+            warn_blocked(scan.err)
     return ended
 
 
@@ -434,15 +451,25 @@ def cmd_rescan(max_minutes):
 
 
 def cmd_vod(url, post):
+    if post:
+        discord("🧪 เริ่มทดสอบ — บอทกำลังดูไลฟ์เก่า อาจใช้เวลา 20–40 นาที")
     info = video_info(url)
     if not info:
+        if post:
+            discord("❌ ทดสอบไม่สำเร็จ: เปิดข้อมูลคลิปจาก YouTube ไม่ได้")
         sys.exit("cannot read video (see error above)")
     scan, _ = scan_vod(info, "test", post, time.time() + 5 * 3600)
-    print("\n=== codes found ===")
+    print(f"\n=== {scan.frames} frames read — codes found ===")
+    lines = []
     for c, n in scan.counts.most_common():
-        print(f"{c}  (seen in {n} frames){'' if n >= CONFIRM else '  <- not confirmed'}")
-    if not scan.counts:
-        print("(none)")
+        lines.append(f"`{c}` (เห็นใน {n} ภาพ){'' if n >= CONFIRM else ' ← ไม่นับ เห็นน้อยไป'}")
+        print(c, n)
+    if scan.frames == 0:
+        if post:
+            discord("❌ ทดสอบไม่สำเร็จ: โหลดวิดีโอไม่ได้\n```" + (scan.err or "no output")[-1500:] + "```")
+        sys.exit("no frames were read — download failed (see output above)")
+    if post:
+        discord(f"🧪 ทดสอบเสร็จ อ่านไป {scan.frames} ภาพ\n" + ("\n".join(lines) if lines else "ไม่เจอโค้ดเลย"))
 
 
 def cmd_image(path):
