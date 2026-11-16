@@ -33,7 +33,8 @@ CHANNEL = os.environ.get("CHANNEL_URL", "https://www.youtube.com/@thehof.talesru
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 COOKIES = os.environ.get("YT_COOKIES_FILE", "")
 INTERVAL = int(os.environ.get("FRAME_INTERVAL", "15"))      # seconds between frames
-CONFIRM = int(os.environ.get("CONFIRM_FRAMES", "2"))        # frames a code must appear in before posting
+# evidence needed before posting: same spelling read cleanly in 2 frames (30 s), or ~8 frames of guessed reads
+THRESHOLD = float(os.environ.get("CODE_THRESHOLD", "4"))
 STATE_DIR = os.environ.get("STATE_DIR", "state")
 GIT_PERSIST = os.environ.get("GIT_PERSIST") == "1"
 # Schedule window in Thai time (streams 14:00-~24:00). Outside it the watcher exits when nothing is live.
@@ -109,33 +110,60 @@ def _fix(window):
 
 
 def extract_codes(lines):
-    found = set()
+    """Return {code: weight} for one frame.
+    Weight: read exactly (anywhere on screen, label or not) = 2,
+    needed OCR letter/digit correction = 1 next to the word CODE, 0.5 otherwise."""
+    found = {}
+
+    def add(c, w):
+        found[c] = max(found.get(c, 0), w)
+
     for line in lines:
         up = line.upper()
+        ctx = "CODE" in re.sub(r"[^A-Z]", "", up.replace("0", "O"))
         # exact matches, also with spaces removed (OCR sometimes splits a code)
         for text in (up, re.sub(r"\s+", "", up)):
             for tok in re.split(r"[^A-Z0-9]+", text):
-                found.update(CODE_RE.findall(tok))
+                for c in CODE_RE.findall(tok):
+                    add(c, 2)
         # fuzzy: tokens about the length of a code
         for tok in re.split(r"[^A-Z0-9]+", up):
             if 12 <= len(tok) <= 14 and not CODE_RE.search(tok):
                 for i in range(len(tok) - 11):
                     c = _fix(tok[i:i + 12])
                     if c:
-                        found.add(c)
+                        add(c, 1 if ctx else 0.5)
     return found
+
+
+def hamming(a, b):
+    return sum(x != y for x, y in zip(a, b)) + abs(len(a) - len(b))
 
 
 _ocr = None
 
 
-def ocr_lines(path):
+def _ocr_img(img):
     global _ocr
     if _ocr is None:
         from rapidocr_onnxruntime import RapidOCR
         _ocr = RapidOCR()
-    result, _ = _ocr(path)
+    result, _ = _ocr(img)
     return [r[1] for r in (result or [])]
+
+
+def ocr_lines(path):
+    """OCR the whole frame, plus 2x-enlarged top and bottom strips where codes are shown."""
+    import cv2
+    img = cv2.imread(path)
+    if img is None:
+        return []
+    h = img.shape[0]
+    lines = _ocr_img(img)
+    for y0, y1 in ((0.0, 0.2), (0.88, 1.0)):
+        crop = img[int(h * y0):int(h * y1), :]
+        lines += _ocr_img(cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC))
+    return lines
 
 
 # ---------------------------------------------------------------- state (one small file per item -> no git conflicts)
@@ -284,7 +312,10 @@ class Scan:
         self.start_ts = info.get("release_timestamp") or info.get("timestamp") or time.time()
         self.mode = mode            # "live" | "rescan" | "test"
         self.post = post
-        self.counts = Counter()
+        self.counts = Counter()     # weighted sightings per exact spelling
+        self.clusters = []          # [{"v": Counter, "posted": code|None}] similar spellings grouped
+        self.frames = 0
+        self.err = ""
         self.state = _load(video_file(self.vid)) or {
             "id": self.vid, "title": self.title, "start": self.start_ts,
             "codes": [], "ended": False, "rescanned": False}
@@ -295,26 +326,60 @@ class Scan:
         except Exception as e:
             log("ocr error:", e)
             return
-        for code in extract_codes(lines):
-            self.counts[code] += 1
-            if self.counts[code] == CONFIRM:
-                self.confirmed(code, path, offset)
+        for code, w in extract_codes(lines).items():
+            self.counts[code] += w
+            cl = next((c for c in self.clusters if any(hamming(code, k) <= 2 for k in c["v"])), None)
+            if cl is None:
+                cl = {"v": Counter(), "posted": None}
+                self.clusters.append(cl)
+            cl["v"][code] += w
+            self.decide(cl, path, offset)
 
-    def confirmed(self, code, path, offset):
+    def decide(self, cl, path, offset):
+        """Post the most-seen spelling once there is enough evidence; correct it if another spelling wins later."""
+        best, best_n = cl["v"].most_common(1)[0]
+        if best_n < THRESHOLD:
+            return
+        if cl["posted"] is None:
+            cl["posted"] = best
+            self.publish(best, path, offset)
+        elif best != cl["posted"] and best_n >= cl["v"][cl["posted"]] + THRESHOLD:
+            old, cl["posted"] = cl["posted"], best
+            self.publish(best, path, offset, wrong=old)
+
+    def _known(self, code):
+        """Already posted before (same code or a near-identical misread of it)?"""
+        if os.path.exists(code_file(code)):
+            return True
+        for p in glob.glob(os.path.join(STATE_DIR, "codes", "*.json")):
+            if hamming(code, os.path.basename(p)[:-5]) <= 1:
+                return True
+        return False
+
+    def publish(self, code, path, offset, wrong=None):
         when = datetime.fromtimestamp(self.start_ts + offset, ICT)
-        log(f"CODE {code}  at {when:%H:%M} (+{hms(offset)})")
+        log(f"CODE {code}  at {when:%H:%M} (+{hms(offset)})" + (f"  (correcting {wrong})" if wrong else ""))
+        label = {"live": "🎁 โค้ดใหม่", "rescan": "🔁 โค้ดที่ตกหล่น (สแกนย้อนหลัง)", "test": "🧪 ทดสอบ"}[self.mode]
+        if wrong:
+            label = f"✏️ แก้ไข: โค้ดที่ส่งไปก่อนหน้า `{wrong}` อ่านผิด ที่ถูกคือ"
         if self.mode == "test":
             if self.post:
-                self.send(code, path, offset, when, "🧪 ทดสอบ")
+                self.send(code, path, offset, when, label)
             return
+        if wrong and wrong in self.state["codes"]:
+            self.state["codes"].remove(wrong)
+            try:
+                os.remove(code_file(wrong))
+            except OSError:
+                pass
         if code not in self.state["codes"]:
             self.state["codes"].append(code)
             _save(video_file(self.vid), self.state)
-        if os.path.exists(code_file(code)):
+        if not wrong and self._known(code):
             return  # already posted (maybe from another stream)
         _save(code_file(code), {"code": code, "video": self.vid, "title": self.title,
                                 "time": when.isoformat(), "offset": int(offset)})
-        self.send(code, path, offset, when, "🎁 โค้ดใหม่" if self.mode == "live" else "🔁 โค้ดที่ตกหล่น (สแกนย้อนหลัง)")
+        self.send(code, path, offset, when, label)
         persist(f"code {code}")
 
     def send(self, code, path, offset, when, label):
@@ -344,7 +409,7 @@ def run_frames(url, scan, offset_fn, deadline):
                 scan.frame(p, offset_fn(n, p))
                 scan.frames += 1
                 if scan.frames % 40 == 0:
-                    log(f"{scan.frames} frames read, codes so far: {dict(scan.counts)}")
+                    log(f"{scan.frames} frames read, top readings: {scan.counts.most_common(6)}")
                 os.remove(p)
             if done:
                 ended = True
@@ -461,9 +526,13 @@ def cmd_vod(url, post):
     scan, _ = scan_vod(info, "test", post, time.time() + 5 * 3600)
     print(f"\n=== {scan.frames} frames read — codes found ===")
     lines = []
-    for c, n in scan.counts.most_common():
-        lines.append(f"`{c}` (เห็นใน {n} ภาพ){'' if n >= CONFIRM else ' ← ไม่นับ เห็นน้อยไป'}")
-        print(c, n)
+    for cl in sorted(scan.clusters, key=lambda c: -sum(c["v"].values())):
+        print(dict(cl["v"]), "-> posted:", cl["posted"])
+        if cl["posted"]:
+            lines.append(f"✅ `{cl['posted']}`")
+    ignored = sum(1 for cl in scan.clusters if not cl["posted"])
+    if ignored:
+        lines.append(f"(ตัดทิ้ง {ignored} อันที่น่าจะอ่านผิด/เห็นน้อยเกินไป)")
     if scan.frames == 0:
         if post:
             discord("❌ ทดสอบไม่สำเร็จ: โหลดวิดีโอไม่ได้\n```" + (scan.err or "no output")[-1500:] + "```")
