@@ -36,6 +36,7 @@ CHANNEL = os.environ.get("CHANNEL_URL", "https://www.youtube.com/@thehof.talesru
 WEBHOOKS = [w for w in re.split(r"[\s,]+", os.environ.get("DISCORD_WEBHOOK_URL", "")) if w.startswith("http")]
 COOKIES = os.environ.get("YT_COOKIES_FILE", "")
 INTERVAL = int(os.environ.get("FRAME_INTERVAL", "15"))      # seconds between frames
+LIVE_CHECK = int(os.environ.get("LIVE_CHECK", "180"))       # seconds between "is it live yet?" checks
 # evidence needed before posting: same spelling read cleanly in 2 frames (30 s), or ~8 frames of guessed reads
 THRESHOLD = float(os.environ.get("CODE_THRESHOLD", "4"))
 MIN_SCORE = float(os.environ.get("OCR_MIN_SCORE", "0.85"))  # OCR confidence needed for a full-weight read
@@ -708,7 +709,7 @@ def cmd_watch(max_minutes):
         if not in_window():
             log("nothing live and outside schedule window -> exit")
             break
-        time.sleep(60)
+        time.sleep(LIVE_CHECK)  # each check is ~5 YouTube requests; checking less often avoids 429
     else:
         if in_window() or get_live():
             open(".continue", "w").close()  # tells the workflow to start the next run right away
