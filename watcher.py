@@ -118,15 +118,17 @@ def _fix(window):
 
 
 def extract_codes(lines):
-    """Return {code: (weight, source text)} for one frame.
+    """Return {code: (weight, source text, sure)} for one frame.
     Weight: confident OCR, code standing on its own anywhere on screen (label or not) = 2;
     low-confidence or buried inside other text = 0.5;
-    needed letter/digit correction = 1 next to the word CODE, 0.25 otherwise."""
+    needed letter/digit correction = 1 next to the word CODE, 0.25 otherwise.
+    sure: OCR was confident (>= MIN_SCORE) about the text it came from."""
     found = {}
 
     def add(c, w, src):
-        if w > found.get(c, (0, ""))[0]:
-            found[c] = (w, src)
+        old = found.get(c, (0, "", False))
+        sure_now = old[2] or score >= MIN_SCORE
+        found[c] = (w, src, sure_now) if w > old[0] else (old[0], old[1], sure_now)
 
     for item in lines:
         line, score = item if isinstance(item, tuple) else (item, 1.0)
@@ -173,26 +175,40 @@ def hamming(a, b):
 _ocr = None
 
 
-def _ocr_img(img):
+def _ocr_img(img, cut_top=False, cut_bottom=False):
+    """OCR one image. cut_top/cut_bottom: that edge was cut out of a bigger frame, so text touching it
+    may be sliced in half (half a line reads as a fake code) -> drop it; the overlapping band has it whole."""
     global _ocr
     if _ocr is None:
         from rapidocr_onnxruntime import RapidOCR
         _ocr = RapidOCR()
     result, _ = _ocr(img)
-    return [(r[1], float(r[2])) for r in (result or [])]
+    h, out = img.shape[0], []
+    for box, text, score in result or []:
+        ys = [p[1] for p in box]
+        if (cut_top and min(ys) <= 4) or (cut_bottom and max(ys) >= h - 5):
+            continue
+        out.append((text, float(score)))
+    return out
+
+
+# horizontal bands read again at 2x so small text is clear, wherever the stream layout puts the codes.
+# They overlap by 10% of the frame, so any line cut by one band's edge is whole in the next band.
+BANDS = ((0.0, 0.4), (0.3, 0.7), (0.6, 1.0))
 
 
 def ocr_lines(path):
-    """OCR the whole frame, plus 2x-enlarged top and bottom strips where codes are shown."""
+    """OCR the whole frame, plus 2x-enlarged overlapping bands."""
     import cv2
     img = cv2.imread(path)
     if img is None:
         return []
     h = img.shape[0]
     lines = _ocr_img(img)
-    for y0, y1 in ((0.0, 0.2), (0.88, 1.0)):
+    for y0, y1 in BANDS:
         crop = img[int(h * y0):int(h * y1), :]
-        lines += _ocr_img(cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC))
+        lines += _ocr_img(cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC),
+                          cut_top=y0 > 0, cut_bottom=y1 < 1)
     return lines
 
 
@@ -347,6 +363,9 @@ def live_source(url, attempt=0):
         info = json.loads(r.stdout) if r.returncode == 0 else {}
     except ValueError:
         info = {}
+    if info and info.get("live_status") != "is_live":
+        # the stream is over: its link now points at the recording, which grab_live must not read
+        return None, f"stream is not live any more ({info.get('live_status')})"
     fmt = info if info.get("url") else (info.get("requested_formats") or [{}])[0]
     if not fmt.get("url"):
         return None, r.stderr.strip()[-3000:] or "no stream link"
@@ -415,7 +434,7 @@ def _parse_media(text, base):
 
 
 def grab_live(scan, src, deadline):
-    """Returns "deadline", "ended", "expired" (get a new link) or "failed" (keeps failing)."""
+    """Returns "deadline", "ended", "stalled" (no new video), "expired" (get a new link) or "failed"."""
     sess = requests.Session()
     sess.headers.update(src["headers"])
     pl_url, last_n, init, errs, last_ok = src["url"], None, None, 0, time.time()
@@ -435,6 +454,8 @@ def grab_live(scan, src, deadline):
                         return "ended"
                     raise RuntimeError("empty playlist")
                 if n == last_n:
+                    if time.time() - last_ok > 180:
+                        return "stalled"  # no new video for 3 minutes: stream probably ended -> caller checks
                     if "#EXT-X-ENDLIST" in text:
                         return "ended"
                 else:
@@ -511,6 +532,7 @@ class Scan:
         self.counts = Counter()     # weighted sightings per exact spelling
         self.clusters = []          # [{"v": Counter, "posted": code|None}] similar spellings grouped
         self.src = {}               # last OCR text each code was read from (for debugging)
+        self.sure = set()           # spellings read at least once with confident OCR
         self.frames = 0
         self.err = ""
         self.state =_load(video_file(self.vid)) or {
@@ -523,11 +545,13 @@ class Scan:
         except Exception as e:
             log("ocr error:", e)
             return
-        for code, (w, src) in extract_codes(lines).items():
+        for code, (w, src, sure) in extract_codes(lines).items():
             if code in blocked():
                 continue
             self.counts[code] += w
             self.src[code] = src
+            if sure:
+                self.sure.add(code)
             cl = next((c for c in self.clusters if any(hamming(code, k) <= 2 for k in c["v"])), None)
             if cl is None:
                 cl = {"v": Counter(), "posted": None}
@@ -538,7 +562,9 @@ class Scan:
     def decide(self, cl, path, offset):
         """Post the most-seen spelling once there is enough evidence; correct it if another spelling wins later."""
         best, best_n = cl["v"].most_common(1)[0]
-        if best_n < THRESHOLD:
+        # never post a spelling that OCR was never confident about, however often it was seen
+        # (e.g. half of a sliced line read again and again while the code stays on screen)
+        if best_n < THRESHOLD or best not in self.sure:
             return
         if cl["posted"] is None:
             cl["posted"] = best
@@ -669,7 +695,11 @@ def watch_stream(info, deadline):
         fails = 0 if scan.frames > before else fails + 1
         if fails == (3 if is_block(scan.err) else 6):
             warn_blocked(scan.err)
-        if res in ("ended", "nolink"):
+        if "not live any more" in scan.err:
+            break
+        # whatever stopped the reading, check the stream is still on (and that no new one replaced it)
+        # before going on -- otherwise the bot keeps retrying a finished stream and misses the next one
+        if res != "expired" or fails:
             again = get_live()
             if not again or again["id"] != scan.vid:
                 break  # stream is over
