@@ -42,7 +42,8 @@ THRESHOLD = float(os.environ.get("CODE_THRESHOLD", "4"))
 MIN_SCORE = float(os.environ.get("OCR_MIN_SCORE", "0.85"))  # OCR confidence needed for a full-weight read
 # Text that looks like a code but isn't (placeholder in the stream overlay template etc.).
 # More can be added one per line in state/blocked.txt
-BLOCKED = {"TONT4N2A2I2I", "ROSA4L8R4Z9I"}
+BLOCKED = {"TONT4N2A2I2I", "ROSA4L8R4Z9I",
+           "TOND0D8E2I6D"}  # 17/11/26: half of a sliced line misread (also removed from summaries)
 STATE_DIR = os.environ.get("STATE_DIR", "state")
 GIT_PERSIST = os.environ.get("GIT_PERSIST") == "1"
 # Schedule window in Thai time (streams 14:00-~24:00). Outside it the watcher exits when nothing is live.
@@ -122,12 +123,14 @@ def extract_codes(lines):
     Weight: confident OCR, code standing on its own anywhere on screen (label or not) = 2;
     low-confidence or buried inside other text = 0.5;
     needed letter/digit correction = 1 next to the word CODE, 0.25 otherwise.
-    sure: OCR was confident (>= MIN_SCORE) about the text it came from."""
+    sure: OCR was confident (>= MIN_SCORE) about the text AND it was the code as-is, or a 12-character
+    word on its own that needed at most 1 letter/digit swap (O->0 etc.). Ordinary words that only turn into
+    a code after several swaps (LOADINGPLEASE -> LOAD1N6P1E4S) are never "sure", so they are never posted."""
     found = {}
 
-    def add(c, w, src):
+    def add(c, w, src, is_sure):
         old = found.get(c, (0, "", False))
-        sure_now = old[2] or score >= MIN_SCORE
+        sure_now = old[2] or is_sure
         found[c] = (w, src, sure_now) if w > old[0] else (old[0], old[1], sure_now)
 
     for item in lines:
@@ -142,14 +145,18 @@ def extract_codes(lines):
                 for c in CODE_RE.findall(tok):
                     # full weight only when the code stands on its own (or right after "CODE" / "CODE1")
                     clean = tok == c or re.fullmatch(r"C[O0]DE\d?" + c, tok)
-                    add(c, 2 if clean and sure else 0.5, src)
+                    add(c, 2 if clean and sure else 0.5, src, sure)
         # fuzzy: tokens about the length of a code
         for tok in re.split(r"[^A-Z0-9]+", up):
             if 12 <= len(tok) <= 14 and not CODE_RE.search(tok):
                 for i in range(len(tok) - 11):
                     c = _fix(tok[i:i + 12])
                     if c:
-                        add(c, 1 if ctx and sure else 0.25, src)
+                        swaps = sum(a != b for a, b in zip(tok[i:i + 12], c))
+                        one_swap = sure and len(tok) == 12 and swaps <= 1  # e.g. C0MB8N1Q3M7T -> COMB8N1Q3M7T
+                        # a confident code-shaped word with one swap counts like a read next to "CODE"
+                        # (not every streamer labels codes), so it is posted after ~1 minute, not ~4
+                        add(c, 1 if sure and (ctx or one_swap) else 0.25, src, one_swap)
     return found
 
 
@@ -327,9 +334,17 @@ def warn_blocked(err):
 # ---------------------------------------------------------------- youtube
 
 
+def _ytdlp_json(args):
+    """Run yt-dlp; a hang (YouTube very slow) counts as a failed attempt instead of crashing the bot."""
+    try:
+        return subprocess.run(ytdlp_cmd() + args, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=120)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 1, "", "yt-dlp timed out (YouTube did not answer in 2 minutes)")
+
+
 def video_info(url):
-    r = subprocess.run(ytdlp_cmd() + ["-J", "--skip-download", "--ignore-no-formats-error", url],
-                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+    r = _ytdlp_json(["-J", "--skip-download", "--ignore-no-formats-error", url])
     if r.returncode != 0:
         err = r.stderr.strip()
         if "Sign in to confirm" in err or "HTTP Error 429" in err:
@@ -357,8 +372,7 @@ FORMATS = ["bv*[height<=1080]/b", "b[height<=720]/bv*[height<=720]/b"]
 def live_source(url, attempt=0):
     """Ask YouTube once for the live stream's video link (HLS playlist; valid for hours).
     Returns ({"url", "headers", "at"}, "") or (None, error text)."""
-    r = subprocess.run(ytdlp_cmd() + ["-J", "-f", FORMATS[attempt % len(FORMATS)], url],
-                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+    r = _ytdlp_json(["-J", "-f", FORMATS[attempt % len(FORMATS)], url])
     try:
         info = json.loads(r.stdout) if r.returncode == 0 else {}
     except ValueError:
@@ -665,11 +679,33 @@ def run_frames(url, scan, offset_fn, deadline, attempt=0):
 
 
 def summary(scan):
+    summary_post(scan.state, scan.title)
+
+
+def summary_post(state, title):
     # drop junk that was saved before it was blocked (e.g. by a run that started with older code)
-    codes = [c for c in scan.state["codes"] if c not in blocked()]
+    codes = [c for c in state["codes"] if c not in blocked()]
     body = "\n".join(f"`{c}`" for c in codes) if codes else "ไม่พบโค้ดในไลฟ์นี้"
     discord(embed={"title": "📋 สรุปโค้ดจากไลฟ์", "color": 0x5865F2,
-                   "description": f"**{scan.title}**\nhttps://youtu.be/{scan.vid}\n\n{body}"})
+                   "description": f"**{title}**\nhttps://youtu.be/{state['id']}\n\n{body}"})
+
+
+def close_unseen_ends(skip_id=None):
+    """A live that ended while no run was watching it (run cancelled, or between two runs) never got its
+    summary nor the "ended" mark the nightly rescan needs. Find those and finish them now."""
+    for path in sorted(glob.glob(os.path.join(STATE_DIR, "videos", "*.json"))):
+        st = _load(path)
+        if not st or st.get("ended") or st.get("id") == skip_id:
+            continue
+        info = video_info(f"https://www.youtube.com/watch?v={st['id']}")
+        if not info or info.get("live_status") == "is_live":
+            continue  # still on (or YouTube did not answer): leave it for the watcher / next time
+        st["ended"] = True
+        _save(path, st)
+        log("live ended while not watched -> closing", st["id"])
+        if time.time() - float(st.get("start") or 0) < 24 * 3600:  # don't post summaries of old lives
+            summary_post(st, st.get("title") or st["id"])
+        persist(f"ended {st['id']}")
 
 
 def watch_stream(info, deadline):
@@ -731,23 +767,37 @@ def cmd_should_run():
 
 def cmd_watch(max_minutes):
     deadline = time.time() + max_minutes * 60
+    closed = False
     while time.time() < deadline - 60:
-        info = get_live()
-        if info:
-            watch_stream(info, deadline - 60)
+        try:
+            info = get_live()
+            if not closed:  # once per run: finish lives that ended while nobody was watching
+                closed = True  # marked first: if it fails, skip it (next run retries) instead of looping
+                close_unseen_ends(skip_id=info["id"] if info else None)
+            if info:
+                watch_stream(info, deadline - 60)
+                continue
+        except Exception as e:  # never let one unexpected error stop the whole run
+            log("ERROR (continuing):", type(e).__name__, e)
+            time.sleep(30)
             continue
         if not in_window():
             log("nothing live and outside schedule window -> exit")
             break
         time.sleep(LIVE_CHECK)  # each check is ~5 YouTube requests; checking less often avoids 429
     else:
-        if in_window() or get_live():
+        try:
+            more = in_window() or get_live()
+        except Exception:
+            more = True  # unsure -> better to start the next run than to stop watching
+        if more:
             open(".continue", "w").close()  # tells the workflow to start the next run right away
     log("watch finished")
 
 
 def cmd_rescan(max_minutes):
     deadline = time.time() + max_minutes * 60
+    close_unseen_ends(skip_id=(get_live() or {}).get("id"))
     for path in sorted(glob.glob(os.path.join(STATE_DIR, "videos", "*.json"))):
         st = _load(path)
         if not st or st.get("rescanned") or not st.get("ended"):
@@ -759,7 +809,10 @@ def cmd_rescan(max_minutes):
             log("VOD not ready:", st["id"])
             continue
         scan, ok = scan_vod(info, "rescan", True, deadline)
-        if ok:
+        # the download can stop early (429, cut connection) and still look "finished":
+        # only count it as rescanned when frames covering ~all of the video were really read
+        need = 0.9 * (info.get("duration") or 0) / INTERVAL
+        if ok and scan.frames > 0 and scan.frames >= need:
             scan.state["rescanned"] = True
             _save(video_file(scan.vid), scan.state)
             persist(f"rescanned {scan.vid}")
