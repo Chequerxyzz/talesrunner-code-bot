@@ -281,13 +281,28 @@ def recovered():
         discord("✅ บอทกลับมาดูไลฟ์ได้แล้ว ไม่ต้องทำอะไรครับ")
 
 
+def is_block(err):
+    return any(s in err for s in ("Sign in to confirm", "HTTP Error 429", "not a bot"))
+
+
+def key_error(err):
+    """The lines that explain the failure (yt-dlp ERROR lines first), not just the tail."""
+    lines = [l for l in err.splitlines() if l.strip()]
+    important = [l for l in lines if "ERROR" in l]
+    return "\n".join((important[-2:] + lines[-2:]) if important else lines[-4:])[-500:]
+
+
 def warn_blocked(err):
     global _warned_block
     if _warned_block:
         return
     _warned_block = True
-    discord("⚠️ บอทเข้า YouTube ไม่ได้ (YouTube อาจบล็อกเซิร์ฟเวอร์ของ GitHub) — "
-            "ดูวิธีแก้ในหัวข้อ \"ถ้า YouTube บล็อก\" ใน README\n```" + err[-300:] + "```")
+    if is_block(err):
+        msg = ("⚠️ บอทเข้า YouTube ไม่ได้ (YouTube บล็อกเซิร์ฟเวอร์ของ GitHub) — "
+               "ดูวิธีแก้ในหัวข้อ \"ถ้า YouTube บล็อก\" ใน README")
+    else:
+        msg = "⚠️ ดึงภาพไลฟ์ไม่ได้มาหลายนาทีแล้ว บอทกำลังลองใหม่เรื่อยๆ"
+    discord(msg + "\n```" + key_error(err) + "```")
 
 
 # ---------------------------------------------------------------- youtube
@@ -316,13 +331,22 @@ def get_live():
     return None
 
 
-def start_pipeline(url, outdir, errpath):
+# video formats to try; after a failed start the next attempt uses the next one
+FORMATS = ["bv*[height<=1080]/b", "b[height<=720]/bv*[height<=720]/b"]
+
+
+def start_pipeline(url, outdir, errpath, attempt=0):
     """yt-dlp -> ffmpeg, writing one JPEG every INTERVAL seconds of video."""
     errf = open(errpath, "wb")
-    y = subprocess.Popen(ytdlp_cmd(need_ffmpeg=True) + ["-f", "bv*[height<=1080]/b", "-o", "-", url],
+    y = subprocess.Popen(ytdlp_cmd(need_ffmpeg=True) + ["-f", FORMATS[attempt % len(FORMATS)], "-o", "-", url],
                          stdout=subprocess.PIPE, stderr=errf)
-    f = subprocess.Popen([ffmpeg_exe(), "-loglevel", "error", "-i", "pipe:0", "-vf", f"fps=1/{INTERVAL}",
-                          "-q:v", "3", os.path.join(outdir, "f_%06d.jpg")], stdin=y.stdout, stderr=errf)
+    # skip broken packets instead of dying on them, and convert every frame to a fixed full-range
+    # JPEG pixel format so the JPEG encoder never rejects a frame (error -22 "Invalid argument")
+    f = subprocess.Popen([ffmpeg_exe(), "-loglevel", "error", "-fflags", "+discardcorrupt+genpts",
+                          "-err_detect", "ignore_err", "-i", "pipe:0", "-map", "0:v:0",
+                          "-vf", f"fps=1/{INTERVAL},scale=-2:'min(1080,ih)':out_range=full,format=yuvj420p",
+                          "-strict", "unofficial", "-q:v", "3", os.path.join(outdir, "f_%06d.jpg")],
+                         stdin=y.stdout, stderr=errf)
     y.stdout.close()
     errf.close()
     return y, f
@@ -436,11 +460,11 @@ class Scan:
         discord(content=code)
 
 
-def run_frames(url, scan, offset_fn, deadline):
+def run_frames(url, scan, offset_fn, deadline, attempt=0):
     """Run the pipeline until the video ends or deadline. Returns True if it ended by itself."""
     tmp = tempfile.mkdtemp(prefix="frames_")
     errpath = tmp + "_err.log"
-    y, f = start_pipeline(url, tmp, errpath)
+    y, f = start_pipeline(url, tmp, errpath, attempt)
     ended = False
     scan.frames = 0
     try:
@@ -469,14 +493,14 @@ def run_frames(url, scan, offset_fn, deadline):
         shutil.rmtree(tmp, ignore_errors=True)
         try:
             with open(errpath, encoding="utf-8", errors="replace") as ef:
-                scan.err = "\n".join(l for l in ef.read().splitlines() if "[download]" not in l)[-800:]
+                scan.err = "\n".join(l for l in ef.read().splitlines() if "[download]" not in l)[-3000:]
             os.remove(errpath)
         except OSError:
             scan.err = ""
     if scan.frames == 0:
         log("NO FRAMES. downloader output:\n" + scan.err)
         # live mode retries by itself and only warns after repeated failures (see watch_stream)
-        if scan.mode != "live" and ("Sign in to confirm" in scan.err or "429" in scan.err):
+        if scan.mode != "live" and is_block(scan.err):
             warn_blocked(scan.err)
     return ended
 
@@ -501,12 +525,16 @@ def watch_stream(info, deadline):
     live_offset = lambda n, p: os.path.getmtime(p) - scan.start_ts
     fails = 0
     while time.time() < deadline:
-        if not run_frames(url, scan, live_offset, deadline):
+        if not run_frames(url, scan, live_offset, deadline, attempt=fails):
             return  # out of time; next run continues this stream
         fails = fails + 1 if scan.frames == 0 else 0
-        if fails == 3:  # a one-off hiccup (e.g. 429 Too Many Requests) is normal; 3 in a row is not
+        if fails:
+            log(f"pipeline failed ({fails} in a row):\n" + key_error(scan.err))
+        # short hiccups (YouTube cuts the stream, a broken segment) fix themselves on retry,
+        # so only tell Discord when it keeps failing: blocked = 3 tries, anything else = 6 tries (~10 min)
+        if fails == (3 if is_block(scan.err) else 6):
             warn_blocked(scan.err)
-        time.sleep(5 if fails == 0 else min(30 * fails, 300))
+        time.sleep(5 if fails <= 1 else min(20 * fails, 180))
         again = get_live()
         if again and again["id"] == scan.vid:
             log("pipeline stopped but stream still live -> restarting")
