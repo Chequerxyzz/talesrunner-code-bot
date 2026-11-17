@@ -26,6 +26,8 @@ import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
+from urllib.parse import urljoin
+
 import requests
 
 # ---------------------------------------------------------------- settings
@@ -350,37 +352,135 @@ def live_source(url, attempt=0):
     return {"url": fmt["url"], "headers": fmt.get("http_headers") or {}, "at": time.time()}, ""
 
 
-def start_ffmpeg(src, outdir, errf, stdin=None, headers=None):
-    args = [ffmpeg_exe(), "-loglevel", "error", "-fflags", "+discardcorrupt+genpts", "-err_detect", "ignore_err"]
-    if src != "pipe:0":
-        # YouTube often answers "429 Too Many Requests" for a moment: wait and retry instead of giving up
-        args += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_on_network_error", "1",
-                 "-reconnect_on_http_error", "429,5xx", "-reconnect_delay_max", "30", "-seg_max_retry", "10"]
-        if headers:
-            args += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in headers.items())]
+JPEG_VF = "scale=-2:'min(1080,ih)':out_range=full,format=yuvj420p"
+
+
+def start_pipeline(url, outdir, errpath, attempt=0):
+    """Finished videos: yt-dlp -> ffmpeg, writing one JPEG every INTERVAL seconds of video."""
+    errf = open(errpath, "wb")
+    y = subprocess.Popen(ytdlp_cmd(need_ffmpeg=True) + ["-f", FORMATS[attempt % len(FORMATS)], "-o", "-", url],
+                         stdout=subprocess.PIPE, stderr=errf)
     # skip broken packets instead of dying on them, and convert every frame to a fixed full-range
     # JPEG pixel format so the JPEG encoder never rejects a frame (error -22 "Invalid argument")
-    args += ["-i", src, "-map", "0:v:0",
-             "-vf", f"fps=1/{INTERVAL},scale=-2:'min(1080,ih)':out_range=full,format=yuvj420p",
-             "-strict", "unofficial", "-q:v", "3", os.path.join(outdir, "f_%06d.jpg")]
-    return subprocess.Popen(args, stdin=stdin, stderr=errf)
-
-
-def start_pipeline(url, outdir, errpath, attempt=0, direct=None):
-    """Write one JPEG every INTERVAL seconds of video.
-    direct = link from live_source(): ffmpeg reads it itself (restarts cost no YouTube requests);
-    otherwise yt-dlp downloads and pipes into ffmpeg (used for finished videos)."""
-    errf = open(errpath, "wb")
-    if direct:
-        y = None
-        f = start_ffmpeg(direct["url"], outdir, errf, headers=direct["headers"])
-    else:
-        y = subprocess.Popen(ytdlp_cmd(need_ffmpeg=True) + ["-f", FORMATS[attempt % len(FORMATS)], "-o", "-", url],
-                             stdout=subprocess.PIPE, stderr=errf)
-        f = start_ffmpeg("pipe:0", outdir, errf, stdin=y.stdout)
-        y.stdout.close()
+    f = subprocess.Popen([ffmpeg_exe(), "-loglevel", "error", "-fflags", "+discardcorrupt+genpts",
+                          "-err_detect", "ignore_err", "-i", "pipe:0", "-map", "0:v:0",
+                          "-vf", f"fps=1/{INTERVAL}," + JPEG_VF, "-strict", "unofficial", "-q:v", "3",
+                          os.path.join(outdir, "f_%06d.jpg")], stdin=y.stdout, stderr=errf)
+    y.stdout.close()
     errf.close()
     return y, f
+
+
+# ---------------------------------------------------------------- live grabber
+# YouTube answers "429 Too Many Requests" to GitHub's servers when the live playlist is re-read every
+# few seconds (what ffmpeg/yt-dlp do), and ffmpeg then just stops. Instead, every INTERVAL seconds we
+# read the playlist once, download only the newest segment and take one frame from it:
+# ~2 small requests per 15 s, and on 429 we simply wait and try again.
+
+
+class LinkExpired(Exception):
+    pass
+
+
+def _hls_get(sess, url, timeout=20):
+    r = sess.get(url, timeout=timeout)
+    if r.status_code in (403, 404, 410):
+        raise LinkExpired(f"HTTP {r.status_code}")
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code} {r.reason}")  # never include the URL (it is long + signed)
+    return r
+
+
+def _pick_variant(text, base):
+    """Master playlist -> best variant up to 1080p."""
+    best, lines = None, text.splitlines()
+    for i, l in enumerate(lines):
+        if l.startswith("#EXT-X-STREAM-INF") and i + 1 < len(lines):
+            m = re.search(r"RESOLUTION=\d+x(\d+)", l)
+            h = int(m.group(1)) if m else 0
+            if h <= 1080 and (best is None or h > best[0]):
+                best = (h, urljoin(base, lines[i + 1].strip()))
+    if not best:
+        raise RuntimeError("no video in master playlist")
+    return best[1]
+
+
+def _parse_media(text, base):
+    m = re.search(r"#EXT-X-MEDIA-SEQUENCE:(\d+)", text)
+    seq = int(m.group(1)) if m else 0
+    segs = [urljoin(base, l.strip()) for l in text.splitlines() if l.strip() and not l.startswith("#")]
+    m = re.search(r'#EXT-X-MAP:.*URI="([^"]+)"', text)
+    return seq + len(segs) - 1, (segs[-1] if segs else None), (urljoin(base, m.group(1)) if m else None)
+
+
+def grab_live(scan, src, deadline):
+    """Returns "deadline", "ended", "expired" (get a new link) or "failed" (keeps failing)."""
+    sess = requests.Session()
+    sess.headers.update(src["headers"])
+    pl_url, last_n, init, errs, last_ok = src["url"], None, None, 0, time.time()
+    tmp = tempfile.mkdtemp(prefix="live_")
+    seg_path = os.path.join(tmp, "seg")
+    try:
+        while time.time() < deadline:
+            t0 = time.time()
+            try:
+                text = _hls_get(sess, pl_url).text
+                if "#EXT-X-STREAM-INF" in text:
+                    pl_url = _pick_variant(text, pl_url)
+                    continue
+                n, seg, init_url = _parse_media(text, pl_url)
+                if seg is None:
+                    if "#EXT-X-ENDLIST" in text:
+                        return "ended"
+                    raise RuntimeError("empty playlist")
+                if n == last_n:
+                    if "#EXT-X-ENDLIST" in text:
+                        return "ended"
+                else:
+                    if init_url and init is None:
+                        init = _hls_get(sess, init_url).content
+                    for i in range(4):  # a refused segment usually works a few seconds later
+                        try:
+                            data = _hls_get(sess, seg, timeout=40).content
+                            break
+                        except RuntimeError:
+                            if i == 3:
+                                raise
+                            time.sleep(3 * (i + 1))
+                    with open(seg_path, "wb") as f:
+                        f.write((init or b"") + data)
+                    path = os.path.join(tmp, f"f_{n % 1000000:06d}.jpg")
+                    r = subprocess.run([ffmpeg_exe(), "-loglevel", "error", "-y", "-err_detect", "ignore_err",
+                                        "-i", seg_path, "-map", "0:v:0", "-frames:v", "1", "-vf", JPEG_VF,
+                                        "-strict", "unofficial", "-q:v", "3", path],
+                                       capture_output=True, text=True, errors="replace", timeout=60)
+                    if not os.path.exists(path):
+                        raise RuntimeError("ffmpeg: " + (r.stderr.strip()[-300:] or "no frame"))
+                    last_n, errs, last_ok = n, 0, time.time()
+                    scan.frame(path, time.time() - scan.start_ts)
+                    scan.frames += 1
+                    recovered()
+                    if scan.frames % 40 == 0:
+                        log(f"{scan.frames} frames read, top readings: {scan.counts.most_common(6)}")
+                    os.remove(path)
+            except LinkExpired as e:
+                scan.err = f"stream link stopped working ({e})"
+                log(scan.err)
+                return "expired"
+            except Exception as e:
+                errs += 1
+                scan.err = f"{type(e).__name__}: {e}"[:500]
+                log(f"live read error ({errs} in a row): {scan.err}")
+                if time.time() - last_ok > 600:  # ~10 minutes without a single frame
+                    warn_blocked(scan.err)
+                if errs >= 8:
+                    return "failed"
+                time.sleep(min(10 * errs, 60))  # 429 etc.: back off, then try again
+                continue
+            time.sleep(max(1.0, INTERVAL - (time.time() - t0)))
+        return "deadline"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def stop(*procs):
@@ -492,11 +592,11 @@ class Scan:
         discord(content=code)
 
 
-def run_frames(url, scan, offset_fn, deadline, attempt=0, direct=None):
+def run_frames(url, scan, offset_fn, deadline, attempt=0):
     """Run the pipeline until the video ends or deadline. Returns True if it ended by itself."""
     tmp = tempfile.mkdtemp(prefix="frames_")
     errpath = tmp + "_err.log"
-    y, f = start_pipeline(url, tmp, errpath, attempt, direct)
+    y, f = start_pipeline(url, tmp, errpath, attempt)
     ended = False
     scan.frames = 0
     try:
@@ -554,37 +654,27 @@ def watch_stream(info, deadline):
                        "description": f"**{scan.title}**\nhttps://youtu.be/{scan.vid}"})
         persist(f"live {scan.vid}")
     log("watching", scan.vid, scan.title)
-    live_offset = lambda n, p: os.path.getmtime(p) - scan.start_ts
     fails = 0
-    src = None  # stream link, reused across restarts: asking YouTube for it again is what triggers 429s
     while time.time() < deadline:
-        if src is None or fails >= 2 or time.time() - src["at"] > 3 * 3600:
-            src, err = live_source(url, fails)
+        src, err = live_source(url, fails)  # one YouTube request round; the link then lasts for hours
+        before = scan.frames
         if src:
-            if not run_frames(url, scan, live_offset, deadline, direct=src):
+            res = grab_live(scan, src, deadline)
+            if res == "deadline":
                 return  # out of time; next run continues this stream
         else:
-            scan.frames, scan.err = 0, err
-        fails = fails + 1 if scan.frames == 0 else 0
-        if fails:
-            log(f"pipeline failed ({fails} in a row):\n" + key_error(scan.err))
-        # short hiccups (429, a cut or broken segment) fix themselves on retry,
-        # so only tell Discord when it keeps failing: blocked = 3 tries, anything else = 6 tries (~10 min)
+            res, scan.err = "nolink", err
+            log("could not get the stream link: " + key_error(err))
+        fails = 0 if scan.frames > before else fails + 1
         if fails == (3 if is_block(scan.err) else 6):
             warn_blocked(scan.err)
+        if res in ("ended", "nolink"):
+            again = get_live()
+            if not again or again["id"] != scan.vid:
+                break  # stream is over
         limited = any(s in scan.err for s in ("429", "Too Many Requests", "No video formats"))
-        time.sleep(3 if fails == 0 else min((60 if limited else 20) * fails, 300))
-        if src and fails < 2 and any(s in scan.err for s in (
-                "429", "Too Many Requests", "Failed to reload playlist", "Error during demuxing",
-                "Connection reset", "timed out", "I/O error")):
-            # stopped because of an error, not because the stream ended -> reuse the link, no YouTube request
-            log("pipeline stopped with an error -> restarting from the same stream link")
-            continue
-        again = get_live()
-        if again and again["id"] == scan.vid:
-            log("pipeline stopped but stream still live -> restarting")
-            continue
-        break
+        time.sleep(2 if fails == 0 else min((60 if limited else 20) * fails, 300))
+        log(f"getting a fresh stream link ({res})")
     else:
         return
     scan.state["ended"] = True
