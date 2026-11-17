@@ -335,24 +335,56 @@ def get_live():
 FORMATS = ["bv*[height<=1080]/b", "b[height<=720]/bv*[height<=720]/b"]
 
 
-def start_pipeline(url, outdir, errpath, attempt=0):
-    """yt-dlp -> ffmpeg, writing one JPEG every INTERVAL seconds of video."""
-    errf = open(errpath, "wb")
-    y = subprocess.Popen(ytdlp_cmd(need_ffmpeg=True) + ["-f", FORMATS[attempt % len(FORMATS)], "-o", "-", url],
-                         stdout=subprocess.PIPE, stderr=errf)
+def live_source(url, attempt=0):
+    """Ask YouTube once for the live stream's video link (HLS playlist; valid for hours).
+    Returns ({"url", "headers", "at"}, "") or (None, error text)."""
+    r = subprocess.run(ytdlp_cmd() + ["-J", "-f", FORMATS[attempt % len(FORMATS)], url],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+    try:
+        info = json.loads(r.stdout) if r.returncode == 0 else {}
+    except ValueError:
+        info = {}
+    fmt = info if info.get("url") else (info.get("requested_formats") or [{}])[0]
+    if not fmt.get("url"):
+        return None, r.stderr.strip()[-3000:] or "no stream link"
+    return {"url": fmt["url"], "headers": fmt.get("http_headers") or {}, "at": time.time()}, ""
+
+
+def start_ffmpeg(src, outdir, errf, stdin=None, headers=None):
+    args = [ffmpeg_exe(), "-loglevel", "error", "-fflags", "+discardcorrupt+genpts", "-err_detect", "ignore_err"]
+    if src != "pipe:0":
+        # YouTube often answers "429 Too Many Requests" for a moment: wait and retry instead of giving up
+        args += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_on_network_error", "1",
+                 "-reconnect_on_http_error", "429,5xx", "-reconnect_delay_max", "30", "-seg_max_retry", "10"]
+        if headers:
+            args += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in headers.items())]
     # skip broken packets instead of dying on them, and convert every frame to a fixed full-range
     # JPEG pixel format so the JPEG encoder never rejects a frame (error -22 "Invalid argument")
-    f = subprocess.Popen([ffmpeg_exe(), "-loglevel", "error", "-fflags", "+discardcorrupt+genpts",
-                          "-err_detect", "ignore_err", "-i", "pipe:0", "-map", "0:v:0",
-                          "-vf", f"fps=1/{INTERVAL},scale=-2:'min(1080,ih)':out_range=full,format=yuvj420p",
-                          "-strict", "unofficial", "-q:v", "3", os.path.join(outdir, "f_%06d.jpg")],
-                         stdin=y.stdout, stderr=errf)
-    y.stdout.close()
+    args += ["-i", src, "-map", "0:v:0",
+             "-vf", f"fps=1/{INTERVAL},scale=-2:'min(1080,ih)':out_range=full,format=yuvj420p",
+             "-strict", "unofficial", "-q:v", "3", os.path.join(outdir, "f_%06d.jpg")]
+    return subprocess.Popen(args, stdin=stdin, stderr=errf)
+
+
+def start_pipeline(url, outdir, errpath, attempt=0, direct=None):
+    """Write one JPEG every INTERVAL seconds of video.
+    direct = link from live_source(): ffmpeg reads it itself (restarts cost no YouTube requests);
+    otherwise yt-dlp downloads and pipes into ffmpeg (used for finished videos)."""
+    errf = open(errpath, "wb")
+    if direct:
+        y = None
+        f = start_ffmpeg(direct["url"], outdir, errf, headers=direct["headers"])
+    else:
+        y = subprocess.Popen(ytdlp_cmd(need_ffmpeg=True) + ["-f", FORMATS[attempt % len(FORMATS)], "-o", "-", url],
+                             stdout=subprocess.PIPE, stderr=errf)
+        f = start_ffmpeg("pipe:0", outdir, errf, stdin=y.stdout)
+        y.stdout.close()
     errf.close()
     return y, f
 
 
 def stop(*procs):
+    procs = [p for p in procs if p]
     for p in procs:
         if p.poll() is None:
             p.terminate()
@@ -460,11 +492,11 @@ class Scan:
         discord(content=code)
 
 
-def run_frames(url, scan, offset_fn, deadline, attempt=0):
+def run_frames(url, scan, offset_fn, deadline, attempt=0, direct=None):
     """Run the pipeline until the video ends or deadline. Returns True if it ended by itself."""
     tmp = tempfile.mkdtemp(prefix="frames_")
     errpath = tmp + "_err.log"
-    y, f = start_pipeline(url, tmp, errpath, attempt)
+    y, f = start_pipeline(url, tmp, errpath, attempt, direct)
     ended = False
     scan.frames = 0
     try:
@@ -524,17 +556,30 @@ def watch_stream(info, deadline):
     log("watching", scan.vid, scan.title)
     live_offset = lambda n, p: os.path.getmtime(p) - scan.start_ts
     fails = 0
+    src = None  # stream link, reused across restarts: asking YouTube for it again is what triggers 429s
     while time.time() < deadline:
-        if not run_frames(url, scan, live_offset, deadline, attempt=fails):
-            return  # out of time; next run continues this stream
+        if src is None or fails >= 2 or time.time() - src["at"] > 3 * 3600:
+            src, err = live_source(url, fails)
+        if src:
+            if not run_frames(url, scan, live_offset, deadline, direct=src):
+                return  # out of time; next run continues this stream
+        else:
+            scan.frames, scan.err = 0, err
         fails = fails + 1 if scan.frames == 0 else 0
         if fails:
             log(f"pipeline failed ({fails} in a row):\n" + key_error(scan.err))
-        # short hiccups (YouTube cuts the stream, a broken segment) fix themselves on retry,
+        # short hiccups (429, a cut or broken segment) fix themselves on retry,
         # so only tell Discord when it keeps failing: blocked = 3 tries, anything else = 6 tries (~10 min)
         if fails == (3 if is_block(scan.err) else 6):
             warn_blocked(scan.err)
-        time.sleep(5 if fails <= 1 else min(20 * fails, 180))
+        limited = any(s in scan.err for s in ("429", "Too Many Requests", "No video formats"))
+        time.sleep(3 if fails == 0 else min((60 if limited else 20) * fails, 300))
+        if src and fails < 2 and any(s in scan.err for s in (
+                "429", "Too Many Requests", "Failed to reload playlist", "Error during demuxing",
+                "Connection reset", "timed out", "I/O error")):
+            # stopped because of an error, not because the stream ended -> reuse the link, no YouTube request
+            log("pipeline stopped with an error -> restarting from the same stream link")
+            continue
         again = get_live()
         if again and again["id"] == scan.vid:
             log("pipeline stopped but stream still live -> restarting")
