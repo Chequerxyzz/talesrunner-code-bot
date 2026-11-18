@@ -36,7 +36,13 @@ CHANNEL = os.environ.get("CHANNEL_URL", "https://www.youtube.com/@thehof.talesru
 WEBHOOKS = [w for w in re.split(r"[\s,]+", os.environ.get("DISCORD_WEBHOOK_URL", "")) if w.startswith("http")]
 COOKIES = os.environ.get("YT_COOKIES_FILE", "")
 INTERVAL = int(os.environ.get("FRAME_INTERVAL", "15"))      # seconds between frames
-LIVE_CHECK = int(os.environ.get("LIVE_CHECK", "60"))       # seconds between "is it live yet?" checks
+# "Is it live yet?" checks while waiting (each check is ~5 YouTube requests -> fewer checks, fewer 429s).
+# The channel lives on a fixed schedule, so check often only around the scheduled start times.
+LIVE_SLOTS = os.environ.get("LIVE_SLOTS", "14:00,16:30,19:00,21:30")  # scheduled start times (Thai time)
+SLOT_BEFORE = int(os.environ.get("SLOT_BEFORE", "10"))     # minutes before a start time to check often
+SLOT_AFTER = int(os.environ.get("SLOT_AFTER", "20"))       # minutes after (streamers often start late)
+LIVE_CHECK_NEAR = int(os.environ.get("LIVE_CHECK_NEAR", "180"))  # seconds between checks near a start time
+LIVE_CHECK = int(os.environ.get("LIVE_CHECK", "600"))           # seconds between checks at other times
 # evidence needed before posting: same spelling read cleanly in 2 frames (30 s), or ~8 frames of guessed reads
 THRESHOLD = float(os.environ.get("CODE_THRESHOLD", "4"))
 MIN_SCORE = float(os.environ.get("OCR_MIN_SCORE", "0.85"))  # OCR confidence needed for a full-weight read
@@ -47,7 +53,8 @@ BLOCKED = {"TONT4N2A2I2I", "ROSA4L8R4Z9I",
 STATE_DIR = os.environ.get("STATE_DIR", "state")
 GIT_PERSIST = os.environ.get("GIT_PERSIST") == "1"
 # Schedule window in Thai time (streams 14:00-~24:00). Outside it the watcher exits when nothing is live.
-WINDOW_START = os.environ.get("WINDOW_START", "13:30")
+# Starts well before 14:00 because GitHub's timer often skips/delays runs (gaps of up to ~1.5 h seen).
+WINDOW_START = os.environ.get("WINDOW_START", "12:30")
 WINDOW_END = os.environ.get("WINDOW_END", "00:45")
 ICT = timezone(timedelta(hours=7))
 
@@ -73,6 +80,23 @@ def in_window(now=None):
     m = now.hour * 60 + now.minute
     s, e = _mins(WINDOW_START), _mins(WINDOW_END)
     return s <= m <= e if s <= e else (m >= s or m <= e)
+
+
+def next_check_delay(now=None):
+    """Seconds to wait before the next "is it live yet?" check: LIVE_CHECK_NEAR around scheduled start
+    times, LIVE_CHECK otherwise -- but never sleeping past the start of the next "check often" period."""
+    now = now or datetime.now(ICT)
+    m = now.hour * 60 + now.minute + now.second / 60
+    wait = LIVE_CHECK
+    for slot in filter(None, (s.strip() for s in LIVE_SLOTS.split(","))):
+        s = _mins(slot)
+        for day in (-1440, 0, 1440):  # periods that cross midnight
+            lo, hi = s - SLOT_BEFORE + day, s + SLOT_AFTER + day
+            if lo <= m < hi:
+                return LIVE_CHECK_NEAR
+            if m < lo:
+                wait = min(wait, (lo - m) * 60)
+    return max(5, int(wait))
 
 
 def ffmpeg_exe():
@@ -784,7 +808,8 @@ def cmd_watch(max_minutes):
         if not in_window():
             log("nothing live and outside schedule window -> exit")
             break
-        time.sleep(LIVE_CHECK)  # each check is ~5 YouTube requests; checking less often avoids 429
+        # often near scheduled start times, rarely otherwise; never sleep past the end of this run
+        time.sleep(max(1, min(next_check_delay(), deadline - 60 - time.time())))
     else:
         try:
             more = in_window() or get_live()
