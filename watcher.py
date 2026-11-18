@@ -50,6 +50,7 @@ MIN_SCORE = float(os.environ.get("OCR_MIN_SCORE", "0.85"))  # OCR confidence nee
 # More can be added one per line in state/blocked.txt
 BLOCKED = {"TONT4N2A2I2I", "ROSA4L8R4Z9I",
            "TOND0D8E2I6D"}  # 17/11/26: half of a sliced line misread (also removed from summaries)
+REDEEM_URL = "https://member.thehof.gg/talesrunner/itemcode"  # "🎁 เติมโค้ด" link in each code post
 STATE_DIR = os.environ.get("STATE_DIR", "state")
 GIT_PERSIST = os.environ.get("GIT_PERSIST") == "1"
 # Schedule window in Thai time (streams 14:00-~24:00). Outside it the watcher exits when nothing is live.
@@ -648,9 +649,12 @@ class Scan:
 
     def send(self, code, path, offset, when, label):
         link = f"https://youtu.be/{self.vid}?t={int(offset)}"
+        # live posts arrive within a minute, so Discord's own timestamp already shows the time;
+        # rescan/test posts come later, so they keep when the code was on screen
+        stamp = "" if self.mode == "live" else f"🕒 {when:%d/%m %H:%M} น. · "
         discord(content=f"{label}\n```\n{code}\n```",  # code box: one-click copy button on a computer
-                embed={"description": f"📺 **{self.title}**\n🕒 {when:%d/%m %H:%M} น. "
-                                      f"(นาทีที่ {hms(offset)}) — [ดูช่วงนี้]({link})",
+                embed={"description": f"{stamp}นาทีที่ {hms(offset)} · [▶️ ดูช่วงนี้]({link})"
+                                      f" · [🎁 เติมโค้ด]({REDEEM_URL})",
                        "color": 0xF5A623},
                 image=path)
         # the code goes alone in its own message, so on a phone "long-press → Copy Text" copies just the code
