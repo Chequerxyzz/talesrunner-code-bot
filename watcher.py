@@ -53,6 +53,9 @@ BLOCKED = {"TONT4N2A2I2I", "ROSA4L8R4Z9I",
 REDEEM_URL = "https://member.thehof.gg/talesrunner/itemcode"  # "🎁 เติมโค้ด" link in each code post
 STATE_DIR = os.environ.get("STATE_DIR", "state")
 GIT_PERSIST = os.environ.get("GIT_PERSIST") == "1"
+# 📋 end-of-live summary on/off. Set the GitHub repository variable SUMMARY to 0 to turn it off;
+# not set / empty / anything else = on. (Marking the live as ended, needed by the nightly rescan, always happens.)
+SUMMARY = os.environ.get("SUMMARY", "").strip() not in ("0", "off", "no", "false")
 # Schedule window in Thai time (streams 14:00-~24:00). Outside it the watcher exits when nothing is live.
 # Starts well before 14:00 because GitHub's timer often skips/delays runs (gaps of up to ~1.5 h seen).
 WINDOW_START = os.environ.get("WINDOW_START", "12:30")
@@ -711,6 +714,9 @@ def summary(scan):
 
 
 def summary_post(state, title):
+    if not SUMMARY:
+        log("summary is turned off (SUMMARY=0) -> not posted")
+        return
     # drop junk that was saved before it was blocked (e.g. by a run that started with older code)
     codes = [c for c in state["codes"] if c not in blocked()]
     body = "\n".join(f"`{c}`" for c in codes) if codes else "ไม่พบโค้ดในไลฟ์นี้"
