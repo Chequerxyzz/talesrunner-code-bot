@@ -70,6 +70,7 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           YT_COOKIES_FILE: cookies.txt
           GIT_PERSIST: "1"
+          SUMMARY: ${{ vars.SUMMARY }}   # repository variable; 0 = no 📋 end-of-live summary
         run: python watcher.py watch --max-minutes 330
       # GitHub's timer is unreliable, so each run starts the next one while streams may still be on
       #   (watcher.py leaves a .continue file only when it ran out of time, never after a crash)
@@ -111,6 +112,7 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           YT_COOKIES_FILE: cookies.txt
           GIT_PERSIST: "1"
+          SUMMARY: ${{ vars.SUMMARY }}   # repository variable; 0 = no 📋 end-of-live summary
         run: python watcher.py rescan --max-minutes 330
 
   test:
